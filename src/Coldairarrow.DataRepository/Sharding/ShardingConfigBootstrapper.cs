@@ -75,6 +75,13 @@ namespace Coldairarrow.DataRepository
                 FindTable = findTable,
                 PhysicTables = value
             });
+
+            //动态实体模型
+            var absEntityType = DbModelFactory.GetEntityType(absTableName);
+            value.ForEach(aPhysicTable =>
+            {
+                DbModelFactory.AddEntityType(aPhysicTable.physicTableName, ShardingHelper.MapTable(absEntityType, aPhysicTable.physicTableName));
+            });
         }
 
         void IAddAbstractTable.AddAbsTable(string absTableName, Action<IAddPhysicTable> physicTableBuilder, IShardingRule rule)
@@ -88,8 +95,10 @@ namespace Coldairarrow.DataRepository
 
         private ShardingConfig _config { get; } = ShardingConfig.Instance;
         private List<AbstractTable> _absTables { get; } = new List<AbstractTable>();
-        private List<(string conString, ReadWriteType opType)> _physicDbs { get; } = new List<(string conString, ReadWriteType opType)>();
-        private List<(string physicTableName, string dataSourceName)> _physicTables { get; } = new List<(string physicTableName, string dataSourceName)>();
+        private List<(string conString, ReadWriteType opType)> _physicDbs { get; }
+            = new List<(string conString, ReadWriteType opType)>();
+        private List<(string physicTableName, string dataSourceName)> _physicTables { get; }
+            = new List<(string physicTableName, string dataSourceName)>();
 
         #endregion
     }

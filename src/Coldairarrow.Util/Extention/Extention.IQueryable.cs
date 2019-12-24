@@ -8,6 +8,7 @@ using System.Linq;
 using System.Linq.Dynamic.Core;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Threading.Tasks;
 
 namespace Coldairarrow.Util
 {
@@ -17,6 +18,16 @@ namespace Coldairarrow.Util
     /// </summary>
     public static partial class Extention
     {
+        //public static Task<int> CountAsync(this IQueryable queryable)
+        //{
+        //    IQueryable<object> q = null;
+        //    q.CountAsync
+        //    var dbSet = context.GetType().GetMethod("Set").MakeGenericMethod(entityType).Invoke(context, null);
+        //    var resQ = typeof(EntityFrameworkQueryableExtensions).GetMethod("AsNoTracking").MakeGenericMethod(entityType).Invoke(null, new object[] { dbSet });
+
+        //    return resQ as IQueryable;
+        //}
+
         /// <summary>
         /// 获取分页后的数据
         /// </summary>
@@ -48,12 +59,18 @@ namespace Coldairarrow.Util
         /// <typeparam name="T">实体类型</typeparam>
         /// <param name="source">数据源IQueryable</param>
         /// <param name="pagination">分页参数</param>
+        /// <param name="thenOrderBy">再排序</param>
         /// <returns></returns>
-        public static IQueryable<T> GetPagination<T>(this IQueryable<T> source, Pagination pagination)
+        public static IQueryable<T> GetPagination<T>(this IQueryable<T> source, Pagination pagination, params (string SortField, string SortType)[] thenOrderBy)
         {
             pagination.Total = source.Count();
-            source = source.OrderBy(pagination.SortField, pagination.SortType);
-            return source.Skip((pagination.PageIndex - 1) * pagination.PageRows).Take(pagination.PageRows);
+            var orderSource = source.OrderBy(pagination.SortField, pagination.SortType);
+
+            thenOrderBy?.ForEach(aOrder =>
+            {
+                orderSource = orderSource.ThenBy($"{aOrder.SortField} {aOrder.SortType}");
+            });
+            return orderSource.Skip((pagination.PageIndex - 1) * pagination.PageRows).Take(pagination.PageRows);
         }
 
         /// <summary>

@@ -1,10 +1,7 @@
 ﻿using Autofac;
 using Autofac.Extras.DynamicProxy;
-using Coldairarrow.DataRepository;
-using Coldairarrow.Entity.Base_Manage;
 using Coldairarrow.Util;
 using System;
-using System.IO;
 using System.Linq;
 
 namespace Coldairarrow.Console1
@@ -32,11 +29,11 @@ namespace Coldairarrow.Console1
 
             AutofacHelper.Container = builder.Build();
         }
-
-        static void Main(string[] args)
+        static void Main()
         {
+
             Console.WriteLine("完成");
-            Console.ReadLine();
+            Console.WriteLine();
         }
     }
 }

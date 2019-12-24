@@ -19,22 +19,12 @@ namespace Coldairarrow.DataRepository
 
         static DbModelFactory()
         {
-            InitModelType();
+            InitEntityType();
         }
 
         #endregion
 
         #region 外部接口
-
-        public static void AddObserver(IRepositoryDbContext observer)
-        {
-            _observers.Add(observer);
-        }
-
-        public static void RemoveObserver(IRepositoryDbContext observer)
-        {
-            _observers.Remove(observer);
-        }
 
         /// <summary>
         /// 获取DbCompiledModel
@@ -45,41 +35,56 @@ namespace Coldairarrow.DataRepository
         public static IModel GetDbCompiledModel(string conStr, DatabaseType dbType)
         {
             string modelInfoId = GetCompiledModelIdentity(conStr, dbType);
-            if (_dbCompiledModel.ContainsKey(modelInfoId))
-                return _dbCompiledModel[modelInfoId].Model;
-            else
+            bool success = _dbCompiledModel.TryGetValue(modelInfoId, out IModel resModel);
+            if (!success)
             {
-                var theModelInfo = BuildDbCompiledModelInfo(conStr, dbType);
-                _dbCompiledModel[modelInfoId] = theModelInfo;
-                return theModelInfo.Model;
+                var theLock = _lockDic.GetOrAdd(modelInfoId, new object());
+                lock (theLock)
+                {
+                    success = _dbCompiledModel.TryGetValue(modelInfoId, out resModel);
+                    if (!success)
+                    {
+                        resModel = BuildDbCompiledModel(dbType);
+                        _dbCompiledModel[modelInfoId] = resModel;
+                    }
+                }
             }
+
+            return resModel;
         }
 
         /// <summary>
-        /// 获取模型
+        /// 获取实体模型
         /// </summary>
-        /// <param name="type">原类型</param>
+        /// <param name="tableName">表名</param>
         /// <returns></returns>
-        public static Type GetModel(Type type)
+        public static Type GetEntityType(string tableName)
         {
-            string modelName = type.Name;
+            if (!_entityTypeMap.ContainsKey(tableName))
+                throw new Exception($"表[{tableName}]缺少实体模型!");
 
-            if (_modelTypeMap.ContainsKey(modelName))
-                return _modelTypeMap[modelName];
-            else
-            {
-                _modelTypeMap[modelName] = type;
-                RefreshModel();
+            return _entityTypeMap[tableName];
+        }
 
-                return type;
-            }
+        /// <summary>
+        /// 添加实体模型
+        /// </summary>
+        /// <param name="tableName">表名</param>
+        /// <param name="entityType">实体模型</param>
+        public static void AddEntityType(string tableName, Type entityType)
+        {
+            if (_entityTypeMap.ContainsKey(tableName))
+                throw new Exception($"表[{tableName}]已存在实体模型!");
+
+            _entityTypeMap[tableName] = entityType;
+            _dbCompiledModel.Clear();
         }
 
         #endregion
 
         #region 私有成员
 
-        private static void InitModelType()
+        private static void InitEntityType()
         {
             List<Type> types = GlobalData.FxAllTypes
                 .Where(x => x.GetCustomAttribute(typeof(TableAttribute), false) != null)
@@ -87,65 +92,42 @@ namespace Coldairarrow.DataRepository
 
             types.ForEach(aType =>
             {
-                _modelTypeMap[aType.Name] = aType;
+                _entityTypeMap[aType.Name] = aType;
             });
         }
-        private static SynchronizedCollection<IRepositoryDbContext> _observers { get; } = new SynchronizedCollection<IRepositoryDbContext>();
-        private static ConcurrentDictionary<string, Type> _modelTypeMap { get; } = new ConcurrentDictionary<string, Type>();
-        private static ConcurrentDictionary<string, DbCompiledModelInfo> _dbCompiledModel { get; } = new ConcurrentDictionary<string, DbCompiledModelInfo>();
-        private static DbCompiledModelInfo BuildDbCompiledModelInfo(string nameOrConStr, DatabaseType dbType)
+        private static ConcurrentDictionary<string, Type> _entityTypeMap { get; } =
+            new ConcurrentDictionary<string, Type>();
+        private static ConcurrentDictionary<string, IModel> _dbCompiledModel { get; }
+            = new ConcurrentDictionary<string, IModel>();
+        private static IModel BuildDbCompiledModel(DatabaseType dbType)
         {
-            lock (_buildCompiledModelLock)
+            ConventionSet conventionSet = null;
+            switch (dbType)
             {
-                ConventionSet conventionSet = null;
-                switch (dbType)
-                {
-                    case DatabaseType.SqlServer: conventionSet = SqlServerConventionSetBuilder.Build(); break;
-                    case DatabaseType.MySql: conventionSet = MySqlConventionSetBuilder.Build(); break;
-                    case DatabaseType.PostgreSql: conventionSet = NpgsqlConventionSetBuilder.Build(); break;
-                    case DatabaseType.Oracle: conventionSet = OracleConventionSetBuilder.Build(); break;
-                    default: throw new Exception("暂不支持该数据库!");
-                }
-                ModelBuilder modelBuilder = new ModelBuilder(conventionSet);
-                _modelTypeMap.Values.ForEach(x =>
-                {
-                    modelBuilder.Model.AddEntityType(x);
-                });
-
-                DbCompiledModelInfo newInfo = new DbCompiledModelInfo
-                {
-                    ConStr = nameOrConStr,
-                    DatabaseType = dbType,
-                    Model = modelBuilder.FinalizeModel()
-                };
-                return newInfo;
+                case DatabaseType.SqlServer: conventionSet = SqlServerConventionSetBuilder.Build(); break;
+                case DatabaseType.MySql: conventionSet = MySqlConventionSetBuilder.Build(); break;
+                case DatabaseType.PostgreSql: conventionSet = NpgsqlConventionSetBuilder.Build(); break;
+                case DatabaseType.Oracle: conventionSet = OracleConventionSetBuilder.Build(); break;
+                default: throw new Exception("暂不支持该数据库!");
             }
+            ModelBuilder modelBuilder = new ModelBuilder(conventionSet);
+            _entityTypeMap.Values.ForEach(x =>
+            {
+                modelBuilder.Model.AddEntityType(x);
+            });
+
+            return modelBuilder.FinalizeModel();
         }
         private static string GetCompiledModelIdentity(string conStr, DatabaseType dbType)
         {
             return $"{dbType.ToString()}{conStr}";
         }
-        private static object _buildCompiledModelLock { get; } = new object();
-        private static void RefreshModel()
-        {
-            _dbCompiledModel.Values.ForEach(aModelInfo =>
-            {
-                aModelInfo.Model = BuildDbCompiledModelInfo(aModelInfo.ConStr, aModelInfo.DatabaseType).Model;
-            });
-
-            _observers.ForEach(x => x.RefreshDb());
-        }
+        private static readonly ConcurrentDictionary<string, object> _lockDic
+            = new ConcurrentDictionary<string, object>();
 
         #endregion
 
         #region 数据结构
-
-        class DbCompiledModelInfo
-        {
-            public IModel Model { get; set; }
-            public string ConStr { get; set; }
-            public DatabaseType DatabaseType { get; set; }
-        }
 
         #endregion
     }

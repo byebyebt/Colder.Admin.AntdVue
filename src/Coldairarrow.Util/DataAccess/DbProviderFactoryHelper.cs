@@ -45,16 +45,6 @@ namespace Coldairarrow.Util
         {
             var con = GetDbProviderFactory(dbType).CreateConnection();
 
-            //请求结束自动释放
-            try
-            {
-                AutofacHelper.GetScopeService<IDisposableContainer>().AddDisposableObj(con);
-            }
-            catch
-            {
-
-            }
-
             return con;
         }
 
@@ -136,7 +126,7 @@ namespace Coldairarrow.Util
         /// </summary>
         /// <param name="nameOrconStr">连接名或者连接字符串</param>
         /// <returns></returns>
-        public static string GetConStr(string nameOrconStr)
+        public static string GetFullConString(string nameOrconStr)
         {
             string conStr = string.Empty;
             string nameOfDbcon = string.Empty;
@@ -172,7 +162,7 @@ namespace Coldairarrow.Util
             if (conStr.IsNullOrEmpty())
                 conStr = GlobalSwitch.DefaultDbConName;
             DbConnection dbConnection = GetDbConnection(dbType);
-            dbConnection.ConnectionString = GetConStr(conStr);
+            dbConnection.ConnectionString = GetFullConString(conStr);
 
             return dbConnection;
         }

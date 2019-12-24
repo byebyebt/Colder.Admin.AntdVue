@@ -3,7 +3,6 @@ using Coldairarrow.Util;
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Data.Common;
 using System.Linq;
 using System.Linq.Dynamic.Core;
 using System.Linq.Expressions;
@@ -61,36 +60,66 @@ namespace Coldairarrow.Business
         private string _conString { get; }
         private DatabaseType? _dbType { get; }
         private IRepository _service { get; set; }
+        private IRepository _fullService { get; set; }
         private object _serviceLock = new object();
         protected virtual string _valueField { get; } = "Id";
         protected virtual string _textField { get => throw new Exception("请在子类重写"); }
+        private SynchronizedCollection<IRepository> _dbs { get; }
+            = new SynchronizedCollection<IRepository>();
+        private IRepository GetBusRepository(string conString, DatabaseType? dbType, bool autoDispose)
+        {
+            var db = new BusRepository(DbFactory.GetRepository(conString, dbType));
+            if (autoDispose)
+                _dbs.Add(db);
+
+            return db;
+        }
+        private IRepository GetBusRepository(IRepository fullRepository, bool autoDispose)
+        {
+            var db = new BusRepository(fullRepository);
+            if (autoDispose)
+                _dbs.Add(db);
+
+            return db;
+        }
+        private IRepository GetFullRepository(string conString, DatabaseType? dbType, bool autoDispose)
+        {
+            var db = DbFactory.GetRepository(conString, dbType);
+            if (autoDispose)
+                _dbs.Add(db);
+
+            return db;
+        }
+        private void InitDb()
+        {
+            if (_service == null) //双if +lock
+            {
+                lock (_serviceLock)
+                {
+                    if (_service == null)
+                    {
+                        _fullService = GetFullRepository(_conString, _dbType, true);
+                        _service = GetBusRepository(_fullService, true);
+                    }
+                }
+            }
+
+        }
 
         #endregion
 
         #region 外部属性
 
         /// <summary>
-        /// 底层仓储接口,支持跨表操作
+        /// 业务仓储接口(支持软删除),支持联表操作
         /// 注：仅支持单线程操作
+        /// 注：多线程请使用GetNewService(conString,dbType,false),并且需要手动释放
         /// </summary>
-        /// <value>
-        /// The service.
-        /// </value>
         public IRepository Service
         {
             get
             {
-                if (_service == null) //双if +lock
-                {
-                    lock (_serviceLock)
-                    {
-                        if (_service == null)
-                        {
-                            _service = DbFactory.GetRepository(_conString, _dbType);
-                            _service = new BusRepository(_service);
-                        }
-                    }
-                }
+                InitDb();
 
                 return _service;
             }
@@ -103,7 +132,7 @@ namespace Coldairarrow.Business
         /// <returns></returns>
         public IRepository GetNewService()
         {
-            return new BusRepository(DbFactory.GetRepository(_conString, _dbType));
+            return GetBusRepository(_conString, _dbType, true);
         }
 
         /// <summary>
@@ -112,15 +141,49 @@ namespace Coldairarrow.Business
         /// </summary>
         /// <param name="conString">连接字符串</param>
         /// <param name="dbType">数据库类型</param>
+        /// <param name="autoDispose">自动释放</param>
         /// <returns></returns>
-        public IRepository GetNewService(string conString, DatabaseType dbType)
+        public IRepository GetNewService(string conString, DatabaseType dbType, bool autoDispose)
         {
-            return new BusRepository(DbFactory.GetRepository(conString, dbType));
+            return GetBusRepository(conString, dbType, autoDispose);
         }
 
-        public void UseRepository(IRepository repository)
+        /// <summary>
+        /// 完整仓储接口(不支持软删除,直接操作数据库),支持联表操作
+        /// 注：仅支持单线程操作
+        /// 注：多线程请使用GetNewFullService(conString,dbType,false),并且需要手动释放
+        /// </summary>
+        public IRepository FullService
         {
-            _service = repository;
+            get
+            {
+                InitDb();
+
+                return _fullService;
+            }
+        }
+
+        /// <summary>
+        /// 获取新的数据仓储
+        /// 注:支持多线程(每个线程需要单独的IRepository)
+        /// </summary>
+        /// <returns></returns>
+        public IRepository GetNewFullService()
+        {
+            return GetFullRepository(_conString, _dbType, true);
+        }
+
+        /// <summary>
+        /// 获取新的数据仓储
+        /// 注:支持多线程(每个线程需要单独的IRepository)
+        /// </summary>
+        /// <param name="conString">连接字符串</param>
+        /// <param name="dbType">数据库类型</param>
+        /// <param name="autoDispose">自动释放</param>
+        /// <returns></returns>
+        public IRepository GetNewFullService(string conString, DatabaseType dbType, bool autoDispose)
+        {
+            return GetFullRepository(conString, dbType, autoDispose);
         }
 
         #endregion
@@ -286,19 +349,9 @@ namespace Coldairarrow.Business
             Service.UpdateWhere(whereExpre, set);
         }
 
-        /// <summary>
-        /// 使用SQL语句按照条件更新
-        /// 用法:UpdateWhere_Sql"Base_User"(x=&gt;x.Id == "Admin",("Name","小明"))
-        /// 注：生成的SQL类似于UPDATE [TABLE] SET [Name] = 'xxx' WHERE [Id] = 'Admin'
-        /// </summary>
-        /// <param name="where">筛选条件</param>
-        /// <param name="values">字段值设置</param>
-        /// <returns>
-        /// 影响条数
-        /// </returns>
-        public int UpdateWhere_Sql(Expression<Func<T, bool>> where, params (string field, object value)[] values)
+        public int UpdateWhere_Sql(Expression<Func<T, bool>> where, params (string field, UpdateType updateType, object value)[] values)
         {
-            return Service.UpdateWhere_Sql(where, values);
+            return _service.UpdateWhere_Sql(where, values);
         }
 
         #endregion
@@ -372,65 +425,9 @@ namespace Coldairarrow.Business
             return query.GetPagination(pagination).ToList();
         }
 
-        /// <summary>
-        /// 通过Sql查询返回DataTable
-        /// </summary>
-        /// <param name="sql">sql语句</param>
-        /// <returns></returns>
-        public DataTable GetDataTableWithSql(string sql)
-        {
-            return Service.GetDataTableWithSql(sql);
-        }
-
-        /// <summary>
-        /// 通过Sql参数查询返回DataTable
-        /// </summary>
-        /// <param name="sql">Sql语句</param>
-        /// <param name="parameters">查询参数</param>
-        /// <returns></returns>
-        public DataTable GetDataTableWithSql(string sql, List<DbParameter> parameters)
-        {
-            return Service.GetDataTableWithSql(sql, parameters);
-        }
-
-        /// <summary>
-        /// 通过sql返回List
-        /// </summary>
-        /// <param name="sqlStr">sql语句</param>
-        /// <returns></returns>
-        public List<U> GetListBySql<U>(string sqlStr) where U : class, new()
-        {
-            return Service.GetListBySql<U>(sqlStr);
-        }
-
-        /// <summary>
-        /// 通过sql返回list
-        /// </summary>
-        /// <param name="sqlStr">sql语句</param>
-        /// <param name="param">参数</param>
-        /// <returns></returns>
-        public List<U> GetListBySql<U>(string sqlStr, List<DbParameter> param) where U : class, new()
-        {
-            return Service.GetListBySql<U>(sqlStr, param);
-        }
-
         #endregion
 
         #region 执行Sql语句
-
-        /// <summary>
-        /// 执行Sql语句
-        /// </summary>
-        /// <param name="sql">Sql语句</param>
-        public int ExecuteSql(string sql)
-        {
-            return Service.ExecuteSql(sql);
-        }
-
-        public int ExecuteSql(string sql, List<DbParameter> parameters)
-        {
-            return Service.ExecuteSql(sql, parameters);
-        }
 
         #endregion
 
@@ -582,13 +579,14 @@ namespace Coldairarrow.Business
 
         #region Dispose
 
-        /// <summary>
-        /// 执行与释放或重置非托管资源关联的应用程序定义的任务。
-        /// </summary>
-        /// <exception cref="System.NotImplementedException"></exception>
+        private bool _disposed = false;
         public virtual void Dispose()
         {
-            _service?.Dispose();
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            _dbs?.ForEach(x => x?.Dispose());
         }
 
         #endregion

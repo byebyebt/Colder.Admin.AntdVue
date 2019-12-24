@@ -12,15 +12,11 @@ using System.Linq.Dynamic.Core;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 
 namespace Coldairarrow.DataRepository
 {
-    /// <summary>
-    /// 描述：数据库仓储基类类
-    /// 作者：Coldairarrow
-    /// </summary>
-    /// <seealso cref="IRepository" />
-    internal class DbRepository : IRepository, IInternalTransaction
+    internal abstract class DbRepository : IRepository, IInternalTransaction
     {
         #region 构造函数
 
@@ -33,32 +29,15 @@ namespace Coldairarrow.DataRepository
         {
             ConnectionString = conString;
             DbType = dbType;
+            _db = DbFactory.GetDbContext(conString, dbType);
         }
 
         #endregion
 
         #region 私有成员
 
-        protected IRepositoryDbContext Db
-        {
-            get
-            {
-                if (_disposed || _db == null)
-                {
-                    _db = DbFactory.GetDbContext(ConnectionString, DbType);
-                    _disposed = false;
-                }
-
-                return _db;
-            }
-            set
-            {
-                _db = value;
-            }
-        }
-        private IRepositoryDbContext _db { get; set; }
-        protected bool _disposed { get; set; }
-        protected DbTransaction _transaction { get; set; }
+        protected BaseDbContext _db { get; }
+        protected IDbContextTransaction _transaction { get; set; }
         protected static PropertyInfo GetKeyProperty(Type type)
         {
             return GetKeyPropertys(type).FirstOrDefault();
@@ -83,14 +62,6 @@ namespace Coldairarrow.DataRepository
 
             return tableName;
         }
-        private void PackWork(IEnumerable<Type> entityTypes, Action work)
-        {
-            entityTypes.ForEach(x => Db.CheckEntityType(x));
-            work();
-            CommitDb();
-            if (!_openedTransaction)
-                Dispose();
-        }
         protected bool _openedTransaction { get; set; } = false;
         protected virtual string FormatFieldName(string name)
         {
@@ -100,9 +71,10 @@ namespace Coldairarrow.DataRepository
         {
             return $"@{name}";
         }
-        private (string sql, Dictionary<string, object> paramters) GetWhereSql(IQueryable query)
+        private (string sql, List<(string paramterName, object paramterValue)> paramters) GetWhereSql(IQueryable query)
         {
-            Dictionary<string, object> paramters = new Dictionary<string, object>();
+            List<(string paramterName, object paramterValue)> paramters =
+                new List<(string paramterName, object paramterValue)>();
             var querySql = query.ToSql();
             string theQSql = querySql.sql.Replace("\r\n", "\n").Replace("\n", " ");
             //无筛选
@@ -130,10 +102,80 @@ namespace Coldairarrow.DataRepository
             querySql.parameters.ForEach(aData =>
             {
                 if (whereSql.Contains(aData.Key))
-                    paramters.Add(aData.Key, aData.Value);
+                    paramters.Add((aData.Key, aData.Value));
             });
 
             return (whereSql, paramters);
+        }
+        private (string sql, List<(string paramterName, object paramterValue)> paramters) GetDeleteSql(IQueryable iq)
+        {
+            string tableName = iq.ElementType.Name;
+            var whereSql = GetWhereSql(iq);
+            string sql = $"DELETE FROM {FormatFieldName(tableName)} WHERE {whereSql.sql}";
+
+            return (sql, whereSql.paramters);
+        }
+        private List<object> GetDeleteList(Type type, List<string> keys)
+        {
+            var theProperty = GetKeyProperty(type);
+            if (theProperty == null)
+                throw new Exception("该实体没有主键标识！请使用[Key]标识主键！");
+
+            List<object> deleteList = new List<object>();
+            keys.ForEach(aKey =>
+            {
+                object newData = Activator.CreateInstance(type);
+                var value = aKey.ChangeType(theProperty.PropertyType);
+                theProperty.SetValue(newData, value);
+                deleteList.Add(newData);
+            });
+
+            return deleteList;
+        }
+        private (string sql, List<(string paramterName, object paramterValue)> paramters) GetUpdateWhereSql(IQueryable iq, params (string field, UpdateType updateType, object value)[] values)
+        {
+            string tableName = iq.ElementType.Name;
+            DbProviderFactory dbProviderFactory = DbProviderFactoryHelper.GetDbProviderFactory(DbType);
+            var whereSql = GetWhereSql(iq);
+
+            List<string> propertySetStr = new List<string>();
+
+            values.ToList().ForEach(aProperty =>
+            {
+                var paramterName = FormatParamterName($"_p_{aProperty.field}");
+                string formatedField = FormatFieldName(aProperty.field);
+                whereSql.paramters.Add((paramterName, aProperty.value));
+
+                string setValueBody = string.Empty;
+                switch (aProperty.updateType)
+                {
+                    case UpdateType.Equal: setValueBody = paramterName; break;
+                    case UpdateType.Add: setValueBody = $" {formatedField} + {paramterName} "; break;
+                    case UpdateType.Minus: setValueBody = $" {formatedField} - {paramterName} "; break;
+                    case UpdateType.Multiply: setValueBody = $" {formatedField} * {paramterName} "; break;
+                    case UpdateType.Divide: setValueBody = $" {formatedField} / {paramterName} "; break;
+                    default: throw new Exception("updateType无效");
+                }
+
+                propertySetStr.Add($" {formatedField} = {setValueBody} ");
+            });
+            string sql = $"UPDATE {FormatFieldName(tableName)} SET {string.Join(",", propertySetStr)} WHERE {whereSql.sql}";
+
+            return (sql, whereSql.paramters);
+        }
+        private List<DbParameter> CreateDbParamters(List<(string paramterName, object paramterValue)> paramters)
+        {
+            DbProviderFactory dbProviderFactory = DbProviderFactoryHelper.GetDbProviderFactory(DbType);
+            List<DbParameter> dbParamters = new List<DbParameter>();
+            paramters.ForEach(aParamter =>
+            {
+                var newParamter = dbProviderFactory.CreateParameter();
+                newParamter.ParameterName = aParamter.paramterName;
+                newParamter.Value = aParamter.paramterValue;
+                dbParamters.Add(newParamter);
+            });
+
+            return dbParamters;
         }
 
         #endregion
@@ -143,9 +185,7 @@ namespace Coldairarrow.DataRepository
         public void BeginTransaction(IsolationLevel isolationLevel)
         {
             _openedTransaction = true;
-            _transaction = Db.Database.BeginTransaction(isolationLevel).GetDbTransaction();
-
-            Db.UseTransaction(_transaction);
+            _transaction = _db.Database.BeginTransaction(isolationLevel);
         }
 
         public (bool Success, Exception ex) RunTransaction(Action action, IsolationLevel isolationLevel = IsolationLevel.ReadCommitted)
@@ -168,8 +208,7 @@ namespace Coldairarrow.DataRepository
             }
             finally
             {
-                _openedTransaction = false;
-                Dispose();
+                DisposeTransaction();
             }
 
             return (success, resEx);
@@ -179,519 +218,308 @@ namespace Coldairarrow.DataRepository
 
         #region 数据库相关
 
-        /// <summary>
-        /// 连接字符串
-        /// </summary>
         public string ConnectionString { get; }
-
-        /// <summary>
-        /// 数据库类型
-        /// </summary>
         public DatabaseType DbType { get; }
-
-        /// <summary>
-        /// 提交到数据库
-        /// </summary>
-        public void CommitDb()
-        {
-            Db.SaveChanges();
-        }
-
-        /// <summary>
-        /// 提交事物
-        /// </summary>
         public void CommitTransaction()
         {
             _transaction?.Commit();
         }
-
-        /// <summary>
-        /// 回滚事物
-        /// </summary>
         public void RollbackTransaction()
         {
             _transaction?.Rollback();
         }
-
-        /// <summary>
-        /// 获取DbContext
-        /// </summary>
-        /// <returns></returns>
-        public DbContext GetDbContext()
+        public void DisposeTransaction()
         {
-            return Db.GetDbContext();
+            _db.Detach();
+            _transaction?.Dispose();
+            _openedTransaction = false;
         }
-
-        /// <summary>
-        /// SQL日志处理方法
-        /// </summary>
-        /// <value>
-        /// The handle SQL log.
-        /// </value>
         public Action<string> HandleSqlLog { set => EFCoreSqlLogeerProvider.HandleSqlLog = value; }
-
-        /// <summary>
-        /// 使用已存在的事物
-        /// </summary>
-        /// <param name="transaction">事物对象</param>
-        public void UseTransaction(DbTransaction transaction)
-        {
-            if (_transaction != null)
-                _transaction.Dispose();
-
-            _openedTransaction = true;
-            _transaction = transaction;
-            Db.UseTransaction(transaction);
-        }
-
-        /// <summary>
-        /// 获取事物对象
-        /// </summary>
-        /// <returns></returns>
-        public DbTransaction GetTransaction()
-        {
-            return _transaction;
-        }
 
         #endregion
 
         #region 增加数据
 
-        /// <summary>
-        /// 添加单条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entity">实体对象</param>
-        public void Insert<T>(T entity) where T : class, new()
+        public int Insert<T>(T entity) where T : class, new()
         {
-            Insert(new List<object> { entity });
+            return Insert(new List<T> { entity });
         }
+        public async Task<int> InsertAsync<T>(T entity) where T : class, new()
+        {
+            return await InsertAsync(new List<T> { entity });
+        }
+        public int Insert<T>(List<T> entities) where T : class, new()
+        {
+            _db.AddRange(entities);
+            return _db.SaveChanges();
+        }
+        public async Task<int> InsertAsync<T>(List<T> entities) where T : class, new()
+        {
+            await _db.AddRangeAsync(entities);
 
-        /// <summary>
-        /// 添加多条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entities">实体对象集合</param>
-        public void Insert<T>(List<T> entities) where T : class, new()
-        {
-            Insert(entities.CastToList<object>());
+            return await _db.SaveChangesAsync();
         }
-
-        /// <summary>
-        /// 添加多条记录
-        /// </summary>
-        /// <param name="entities">对象集合</param>
-        public void Insert(List<object> entities)
-        {
-            PackWork(entities.Select(x => x.GetType()), () =>
-            {
-                entities.ForEach(x => Db.Entry(x).State = EntityState.Added);
-            });
-        }
-
-        /// <summary>
-        /// 使用Bulk批量导入,速度快
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entities">实体集合</param>
-        /// <exception cref="NotImplementedException">不支持此操作!</exception>
-        public virtual void BulkInsert<T>(List<T> entities) where T : class, new()
-        {
-            throw new NotImplementedException("不支持此操作!");
-        }
+        public abstract void BulkInsert<T>(List<T> entities) where T : class, new();
 
         #endregion
 
         #region 删除数据
 
-        /// <summary>
-        /// 删除所有记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        public virtual void DeleteAll<T>() where T : class, new()
+        public int DeleteAll<T>() where T : class, new()
         {
-            DeleteAll(typeof(T));
+            return DeleteAll(typeof(T));
         }
-
-        /// <summary>
-        /// 删除所有记录
-        /// </summary>
-        /// <param name="type">实体类型</param>
-        public virtual void DeleteAll(Type type)
+        public async Task<int> DeleteAllAsync<T>() where T : class, new()
         {
-            string tableName = GetDbTableName(type);
-            string sql = $"DELETE FROM {FormatFieldName(tableName)}";
-            ExecuteSql(sql);
+            return await DeleteAllAsync(typeof(T));
         }
-
-        /// <summary>
-        /// 删除单条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entity">实体对象</param>
-        public void Delete<T>(T entity) where T : class, new()
+        public int DeleteAll(Type type)
         {
-            Delete(new List<object> { entity });
+            return Delete_Sql(type, "true");
         }
-
-        /// <summary>
-        /// 删除多条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entities">实体对象集合</param>
-        public void Delete<T>(List<T> entities) where T : class, new()
+        public async Task<int> DeleteAllAsync(Type type)
         {
-            Delete(entities.CastToList<object>());
+            return await Delete_SqlAsync(type, "true");
         }
-
-        /// <summary>
-        /// 删除多条记录
-        /// </summary>
-        /// <param name="entities">实体对象集合</param>
-        public void Delete(List<object> entities)
+        public int Delete<T>(T entity) where T : class, new()
         {
-            PackWork(entities.Select(x => x.GetType()), () =>
-            {
-                entities.ForEach(x => Db.Entry(x).State = EntityState.Deleted);
-            });
+            return Delete(new List<T> { entity });
         }
+        public async Task<int> DeleteAsync<T>(T entity) where T : class, new()
+        {
+            return await DeleteAsync(new List<T> { entity });
+        }
+        public int Delete<T>(List<T> entities) where T : class, new()
+        {
+            _db.RemoveRange(entities);
+            return _db.SaveChanges();
+        }
+        public async Task<int> DeleteAsync<T>(List<T> entities) where T : class, new()
+        {
+            _db.RemoveRange(entities);
 
-        /// <summary>
-        /// 按条件删除记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="condition">筛选条件</param>
-        public void Delete<T>(Expression<Func<T, bool>> condition) where T : class, new()
+            return await _db.SaveChangesAsync();
+        }
+        public int Delete<T>(Expression<Func<T, bool>> condition) where T : class, new()
         {
             var deleteList = GetIQueryable<T>().Where(condition).ToList();
-            Delete(deleteList);
+            return Delete(deleteList);
         }
-
-        /// <summary>
-        /// 删除单条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="key">主键</param>
-        public void Delete<T>(string key) where T : class, new()
+        public async Task<int> DeleteAsync<T>(Expression<Func<T, bool>> condition) where T : class, new()
         {
-            Delete<T>(new List<string> { key });
+            var deleteList = await GetIQueryable<T>().Where(condition).ToListAsync();
+            return await DeleteAsync(deleteList);
         }
-
-        /// <summary>
-        /// 删除多条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="keys">多条记录主键集合</param>
-        public void Delete<T>(List<string> keys) where T : class, new()
+        public int Delete<T>(string key) where T : class, new()
         {
-            Delete(typeof(T), keys);
+            return Delete<T>(new List<string> { key });
         }
-
-        /// <summary>
-        /// 删除单条记录
-        /// </summary>
-        /// <param name="type">实体类型</param>
-        /// <param name="key">主键</param>
-        public void Delete(Type type, string key)
+        public async Task<int> DeleteAsync<T>(string key) where T : class, new()
         {
-            Delete(type, new List<string> { key });
+            return await DeleteAsync<T>(new List<string> { key });
         }
-
-        /// <summary>
-        /// 删除多条记录
-        /// </summary>
-        /// <param name="type">实体类型</param>
-        /// <param name="keys">多条记录主键集合</param>
-        /// <exception cref="Exception">该实体没有主键标识！请使用[Key]标识主键！</exception>
-        public void Delete(Type type, List<string> keys)
+        public int Delete<T>(List<string> keys) where T : class, new()
         {
-            var theProperty = GetKeyProperty(type);
-            if (theProperty == null)
-                throw new Exception("该实体没有主键标识！请使用[Key]标识主键！");
-
-            List<object> deleteList = new List<object>();
-            keys.ForEach(aKey =>
-            {
-                object newData = Activator.CreateInstance(type);
-                var value = aKey.ChangeType(theProperty.PropertyType);
-                theProperty.SetValue(newData, value);
-                deleteList.Add(newData);
-            });
-
-            Delete(deleteList);
+            return Delete(typeof(T), keys);
         }
-
-        /// <summary>
-        /// 使用SQL语句按照条件删除数据
-        /// 用法:Delete_Sql"Base_User"(x=&gt;x.Id == "Admin")
-        /// 注：生成的SQL类似于DELETE FROM [Base_User] WHERE [Name] = 'xxx' WHERE [Id] = 'Admin'
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="where">条件</param>
-        /// <returns>
-        /// 影响条数
-        /// </returns>
+        public async Task<int> DeleteAsync<T>(List<string> keys) where T : class, new()
+        {
+            return await DeleteAsync(typeof(T), keys);
+        }
+        public int Delete(Type type, string key)
+        {
+            return Delete(type, new List<string> { key });
+        }
+        public async Task<int> DeleteAsync(Type type, string key)
+        {
+            return await DeleteAsync(type, new List<string> { key });
+        }
+        public int Delete(Type type, List<string> keys)
+        {
+            return Delete(GetDeleteList(type, keys));
+        }
+        public async Task<int> DeleteAsync(Type type, List<string> keys)
+        {
+            return await DeleteAsync(GetDeleteList(type, keys));
+        }
         public int Delete_Sql<T>(Expression<Func<T, bool>> where) where T : class, new()
         {
             var iq = GetIQueryable<T>().Where(where);
 
-            return _Delete_Sql(iq);
+            return Delete_Sql(iq);
         }
+        public async Task<int> Delete_SqlAsync<T>(Expression<Func<T, bool>> where) where T : class, new()
+        {
+            var iq = GetIQueryable<T>().Where(where);
 
+            return await Delete_SqlAsync(iq);
+        }
         public int Delete_Sql(Type entityType, string where, params object[] paramters)
         {
             var iq = GetIQueryable(entityType).Where(where, paramters);
 
-            return _Delete_Sql(iq);
+            return Delete_Sql(iq);
         }
-
-        private int _Delete_Sql(IQueryable iq)
+        public async Task<int> Delete_SqlAsync(Type entityType, string where, params object[] paramters)
         {
-            string tableName = iq.ElementType.Name;
-            DbProviderFactory dbProviderFactory = DbProviderFactoryHelper.GetDbProviderFactory(DbType);
-            var whereSql = GetWhereSql(iq);
-            var paramters = whereSql.paramters.Select(x =>
-            {
-                var newParamter = dbProviderFactory.CreateParameter();
-                newParamter.ParameterName = x.Key;
-                newParamter.Value = x.Value;
+            var iq = GetIQueryable(entityType).Where(where, paramters);
 
-                return newParamter;
-            }).ToList();
+            return await Delete_SqlAsync(iq);
+        }
+        public int Delete_Sql(IQueryable source)
+        {
+            var sql = GetDeleteSql(source);
 
-            string sql = $"DELETE FROM {FormatFieldName(tableName)} WHERE {whereSql.sql}";
+            return ExecuteSql(sql.sql, sql.paramters.ToArray());
+        }
+        public async Task<int> Delete_SqlAsync(IQueryable source)
+        {
+            var sql = GetDeleteSql(source);
 
-            return ExecuteSql(sql, paramters);
+            return await ExecuteSqlAsync(sql.sql, sql.paramters.ToArray());
         }
 
         #endregion
 
         #region 更新数据
 
-        /// <summary>
-        /// 更新单条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entity">实体对象</param>
-        public void Update<T>(T entity) where T : class, new()
+        public int Update<T>(T entity) where T : class, new()
         {
-            Update(new List<object> { entity });
+            return Update(new List<T> { entity });
         }
-
-        /// <summary>
-        /// 更新多条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entities">实体对象集合</param>
-        public void Update<T>(List<T> entities) where T : class, new()
+        public async Task<int> UpdateAsync<T>(T entity) where T : class, new()
         {
-            Update(entities.CastToList<object>());
+            return await UpdateAsync(new List<T> { entity });
         }
-
-        /// <summary>
-        /// 更新多条记录
-        /// </summary>
-        /// <param name="entities">实体对象集合</param>
-        public void Update(List<object> entities)
+        public int Update<T>(List<T> entities) where T : class, new()
         {
-            PackWork(entities.Select(x => x.GetType()), () =>
+            _db.UpdateRange(entities);
+            return _db.SaveChanges();
+        }
+        public async Task<int> UpdateAsync<T>(List<T> entities) where T : class, new()
+        {
+            _db.UpdateRange(entities);
+
+            return await _db.SaveChangesAsync();
+        }
+        public int UpdateAny<T>(T entity, List<string> properties) where T : class, new()
+        {
+            return UpdateAny(new List<T> { entity }, properties);
+        }
+        public async Task<int> UpdateAnyAsync<T>(T entity, List<string> properties) where T : class, new()
+        {
+            return await UpdateAnyAsync(new List<T> { entity }, properties);
+        }
+        public int UpdateAny<T>(List<T> entities, List<string> properties) where T : class, new()
+        {
+            entities.ForEach(aEntity =>
             {
-                entities.ForEach(x => Db.Entry(x).State = EntityState.Modified);
-            });
-        }
-
-        /// <summary>
-        /// 更新单条记录的某些属性
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entity">实体对象</param>
-        /// <param name="properties">属性</param>
-        public void UpdateAny<T>(T entity, List<string> properties) where T : class, new()
-        {
-            UpdateAny(new List<object> { entity }, properties);
-        }
-
-        /// <summary>
-        /// 更新多条记录的某些属性
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="entities">实体对象集合</param>
-        /// <param name="properties">属性</param>
-        public void UpdateAny<T>(List<T> entities, List<string> properties) where T : class, new()
-        {
-            UpdateAny(entities.CastToList<object>(), properties);
-        }
-
-        /// <summary>
-        /// 更新多条记录的某些属性
-        /// </summary>
-        /// <param name="entities">实体对象集合</param>
-        /// <param name="properties">属性</param>
-        public void UpdateAny(List<object> entities, List<string> properties)
-        {
-            PackWork(entities.Select(x => x.GetType()), () =>
-            {
-                entities.ForEach(aEntity =>
+                properties.ForEach(aProperty =>
                 {
-                    var targetObj = aEntity.ChangeType(Db.CheckEntityType(aEntity.GetType()));
-                    Db.Attach(targetObj);
-                    properties.ForEach(aProperty =>
-                    {
-                        Db.Entry(targetObj).Property(aProperty).IsModified = true;
-                    });
+                    _db.Entry(aEntity).Property(aProperty).IsModified = true;
                 });
             });
-        }
 
-        /// <summary>
-        /// 按照条件更新记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="whereExpre">筛选条件</param>
-        /// <param name="set">更新操作</param>
-        public void UpdateWhere<T>(Expression<Func<T, bool>> whereExpre, Action<T> set) where T : class, new()
+            return _db.SaveChanges();
+        }
+        public async Task<int> UpdateAnyAsync<T>(List<T> entities, List<string> properties) where T : class, new()
+        {
+            return await UpdateAnyAsync(entities, properties);
+        }
+        public int UpdateWhere<T>(Expression<Func<T, bool>> whereExpre, Action<T> set) where T : class, new()
         {
             var list = GetIQueryable<T>().Where(whereExpre).ToList();
             list.ForEach(aData => set(aData));
-            Update(list);
+            return Update(list);
         }
-
-        /// <summary>
-        /// 使用SQL语句按照条件更新
-        /// 用法:UpdateWhere_Sql"Base_User"(x=&gt;x.Id == "Admin",("Name","小明"))
-        /// 注：生成的SQL类似于UPDATE [TABLE] SET [Name] = 'xxx' WHERE [Id] = 'Admin'
-        /// </summary>
-        /// <typeparam name="T">实体类型</typeparam>
-        /// <param name="where">筛选条件</param>
-        /// <param name="values">字段值设置</param>
-        /// <returns>
-        /// 影响条数
-        /// </returns>
-        public int UpdateWhere_Sql<T>(Expression<Func<T, bool>> where, params (string field, object value)[] values) where T : class, new()
+        public async Task<int> UpdateWhereAsync<T>(Expression<Func<T, bool>> whereExpre, Action<T> set) where T : class, new()
+        {
+            var list = GetIQueryable<T>().Where(whereExpre).ToList();
+            list.ForEach(aData => set(aData));
+            return await UpdateAsync(list);
+        }
+        public int UpdateWhere_Sql<T>(Expression<Func<T, bool>> where, params (string field, UpdateType updateType, object value)[] values) where T : class, new()
         {
             var iq = GetIQueryable<T>().Where(where);
 
-            return _UpdateWhere_Sql(iq, values);
+            return UpdateWhere_Sql(iq, values);
         }
+        public async Task<int> UpdateWhere_SqlAsync<T>(Expression<Func<T, bool>> where, params (string field, UpdateType updateType, object value)[] values) where T : class, new()
+        {
+            var iq = GetIQueryable<T>().Where(where);
 
-        public int UpdateWhere_Sql(Type entityType, string where, object[] paramters, params (string field, object value)[] values)
+            return await UpdateWhere_SqlAsync(iq, values);
+        }
+        public int UpdateWhere_Sql(Type entityType, string where, object[] paramters, params (string field, UpdateType updateType, object value)[] values)
         {
             var iq = GetIQueryable(entityType).Where(where, paramters);
 
-            return _UpdateWhere_Sql(iq, values);
+            return UpdateWhere_Sql(iq, values);
         }
-
-        private int _UpdateWhere_Sql(IQueryable iq, params (string field, object value)[] values)
+        public async Task<int> UpdateWhere_SqlAsync(Type entityType, string where, object[] paramters, params (string field, UpdateType updateType, object value)[] values)
         {
-            string tableName = iq.ElementType.Name;
-            DbProviderFactory dbProviderFactory = DbProviderFactoryHelper.GetDbProviderFactory(DbType);
+            var iq = GetIQueryable(entityType).Where(where, paramters);
 
-            List<KeyValuePair<string, object>> parameterList = new List<KeyValuePair<string, object>>();
-            var whereSql = GetWhereSql(iq);
+            return await UpdateWhere_SqlAsync(iq, values);
+        }
+        public int UpdateWhere_Sql(IQueryable source, params (string field, UpdateType updateType, object value)[] values)
+        {
+            var sql = GetUpdateWhereSql(source, values);
 
-            parameterList.AddRange(whereSql.paramters.ToArray());
+            return ExecuteSql(sql.sql, sql.paramters.ToArray());
+        }
+        public async Task<int> UpdateWhere_SqlAsync(IQueryable source, params (string field, UpdateType updateType, object value)[] values)
+        {
+            var sql = GetUpdateWhereSql(source, values);
 
-            List<string> propertySetStr = new List<string>();
-
-            values.ToList().ForEach(aProperty =>
-            {
-                var paramterName = FormatParamterName($"_p_{aProperty.field}");
-                parameterList.Add(new KeyValuePair<string, object>(paramterName, aProperty.value));
-                propertySetStr.Add($" {FormatFieldName(aProperty.field)} = {paramterName} ");
-            });
-
-            var paramters = parameterList.Select(x =>
-            {
-                var newParamter = dbProviderFactory.CreateParameter();
-                newParamter.ParameterName = x.Key;
-                newParamter.Value = x.Value;
-
-                return newParamter;
-            }).ToList();
-
-            string sql = $"UPDATE {FormatFieldName(tableName)} SET {string.Join(",", propertySetStr)} WHERE {whereSql.sql}";
-
-            return ExecuteSql(sql, paramters);
+            return await ExecuteSqlAsync(sql.sql, sql.paramters.ToArray());
         }
 
         #endregion
 
         #region 查询数据
 
-        /// <summary>
-        /// 获取单条记录
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="keyValue">主键</param>
-        /// <returns></returns>
         public T GetEntity<T>(params object[] keyValue) where T : class, new()
         {
-            var obj = Db.Set<T>().Find(keyValue);
+            var obj = _db.Set<T>().Find(keyValue);
             if (!obj.IsNullOrEmpty())
-                Db.Entry(obj).State = EntityState.Detached;
+                _db.Entry(obj).State = EntityState.Detached;
 
             return obj;
         }
+        public async Task<T> GetEntityAsync<T>(params object[] keyValue) where T : class, new()
+        {
+            var obj = await _db.Set<T>().FindAsync(keyValue);
+            if (!obj.IsNullOrEmpty())
+                _db.Entry(obj).State = EntityState.Detached;
 
-        /// <summary>
-        /// 获取所有数据
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <returns></returns>
+            return obj;
+        }
         public List<T> GetList<T>() where T : class, new()
         {
             return GetIQueryable<T>().ToList();
         }
-
-        /// <summary>
-        /// 获取列表
-        /// </summary>
-        /// <param name="type">实体类型</param>
-        /// <returns></returns>
+        public async Task<List<T>> GetListAsync<T>() where T : class, new()
+        {
+            return await GetIQueryable<T>().ToListAsync();
+        }
         public List<object> GetList(Type type)
         {
             return GetIQueryable(type).CastToList<object>();
         }
-
-        /// <summary>
-        /// 获取IQueryable
-        /// 注:默认取消实体追踪
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <returns></returns>
+        public async Task<List<object>> GetListAsync(Type type)
+        {
+            return await GetIQueryable(type).Cast<object>().ToListAsync();
+        }
         public IQueryable<T> GetIQueryable<T>() where T : class, new()
         {
             return GetIQueryable(typeof(T)) as IQueryable<T>;
         }
-
-        /// <summary>
-        /// 获取IQueryable
-        /// 注:默认取消实体追踪
-        /// </summary>
-        /// <param name="type">实体泛型</param>
-        /// <returns></returns>
         public IQueryable GetIQueryable(Type type)
         {
-            return Db.GetIQueryable(type);
+            return _db.GetIQueryable(type);
         }
-
-        /// <summary>
-        /// 通过SQL获取DataTable
-        /// </summary>
-        /// <param name="sql">SQL语句</param>
-        /// <returns></returns>
-        public DataTable GetDataTableWithSql(string sql)
-        {
-            return GetDataTableWithSql(sql, null);
-        }
-
-        /// <summary>
-        /// 通过SQL获取DataTable
-        /// </summary>
-        /// <param name="sql">SQL语句</param>
-        /// <param name="parameters">SQL参数</param>
-        /// <returns></returns>
-        public DataTable GetDataTableWithSql(string sql, List<DbParameter> parameters)
+        public DataTable GetDataTableWithSql(string sql, params (string paramterName, object value)[] parameters)
         {
             DbProviderFactory dbProviderFactory = DbProviderFactoryHelper.GetDbProviderFactory(DbType);
             using (DbConnection conn = dbProviderFactory.CreateConnection())
@@ -708,107 +536,80 @@ namespace Coldairarrow.DataRepository
                     cmd.CommandText = sql;
                     cmd.CommandTimeout = 5 * 60;
 
-                    if (parameters != null && parameters?.Count > 0)
-                        cmd.Parameters.AddRange(parameters.ToArray());
+                    if (parameters != null && parameters.Count() > 0)
+                        cmd.Parameters.AddRange(CreateDbParamters(parameters.ToList()).ToArray());
 
-                    DbDataAdapter adapter = dbProviderFactory.CreateDataAdapter();
-                    adapter.SelectCommand = cmd;
-                    DataSet table = new DataSet();
-                    adapter.Fill(table);
-                    cmd.Parameters.Clear();
+                    DataTable table = new DataTable();
+                    var reader = cmd.ExecuteReader();
+                    table.Load(reader);
 
-                    return table.Tables[0];
+                    return table;
                 }
             }
         }
-
-        /// <summary>
-        /// 通过SQL获取List
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="sqlStr">SQL语句</param>
-        /// <returns></returns>
-        public List<T> GetListBySql<T>(string sqlStr) where T : class, new()
+        public async Task<DataTable> GetDataTableWithSqlAsync(string sql, params (string paramterName, object value)[] parameters)
         {
-            return GetListBySql<T>(sqlStr, new List<DbParameter>());
+            DbProviderFactory dbProviderFactory = DbProviderFactoryHelper.GetDbProviderFactory(DbType);
+            using (DbConnection conn = dbProviderFactory.CreateConnection())
+            {
+                conn.ConnectionString = ConnectionString;
+                if (conn.State != ConnectionState.Open)
+                {
+                    conn.Open();
+                }
+
+                using (DbCommand cmd = conn.CreateCommand())
+                {
+                    cmd.Connection = conn;
+                    cmd.CommandText = sql;
+                    cmd.CommandTimeout = 5 * 60;
+
+                    if (parameters != null && parameters.Count() > 0)
+                        cmd.Parameters.AddRange(CreateDbParamters(parameters.ToList()).ToArray());
+
+                    DataTable table = new DataTable();
+                    var reader = await cmd.ExecuteReaderAsync();
+                    table.Load(reader);
+
+                    return table;
+                }
+            }
         }
-
-        /// <summary>
-        /// 通过SQL获取List
-        /// </summary>
-        /// <typeparam name="T">实体泛型</typeparam>
-        /// <param name="sqlStr">SQL语句</param>
-        /// <param name="parameters">SQL参数</param>
-        /// <returns></returns>
-        public List<T> GetListBySql<T>(string sqlStr, List<DbParameter> parameters) where T : class, new()
+        public List<T> GetListBySql<T>(string sqlStr, params (string paramterName, object value)[] parameters) where T : class, new()
         {
-            return Db.Set<T>().FromSql(sqlStr, parameters.ToArray()).ToList();
+            return _db.Set<T>().FromSql(sqlStr, CreateDbParamters(parameters.ToList()).ToArray()).AsNoTracking().ToList();
+        }
+        public async Task<List<T>> GetListBySqlAsync<T>(string sqlStr, params (string paramterName, object value)[] parameters) where T : class, new()
+        {
+            return await _db.Set<T>().FromSql(sqlStr, CreateDbParamters(parameters.ToList()).ToArray()).AsNoTracking().ToListAsync();
         }
 
         #endregion
 
         #region 执行Sql语句
 
-        /// <summary>
-        /// 执行SQL语句
-        /// </summary>
-        /// <param name="sql">SQL语句</param>
-        public int ExecuteSql(string sql)
+        public int ExecuteSql(string sql, params (string paramterName, object paramterValue)[] paramters)
         {
-            int count = Db.Database.ExecuteSqlCommand(sql);
-
-            if (!_openedTransaction)
-                Dispose();
-
-            return count;
+            return _db.Database.ExecuteSqlCommand(sql, CreateDbParamters(paramters.ToList()).ToArray());
         }
-
-        /// <summary>
-        /// 执行SQL语句
-        /// </summary>
-        /// <param name="sql">SQL语句</param>
-        /// <param name="parameters">SQL参数</param>
-        public int ExecuteSql(string sql, List<DbParameter> parameters)
+        public async Task<int> ExecuteSqlAsync(string sql, params (string paramterName, object paramterValue)[] paramters)
         {
-            int count = Db.Database.ExecuteSqlCommand(sql, parameters.ToArray());
-
-            if (!_openedTransaction)
-                Dispose();
-
-            return count;
+            return await _db.Database.ExecuteSqlCommandAsync(sql, CreateDbParamters(paramters.ToList()).ToArray());
         }
 
         #endregion
 
         #region Dispose
 
-        protected virtual void Dispose(bool disposing)
+        private bool _disposed = false;
+        public virtual void Dispose()
         {
             if (_disposed)
                 return;
 
-            if (disposing)
-            {
-                _transaction?.Dispose();
-                Db?.Dispose();
-            }
-
-            _openedTransaction = false;
-
             _disposed = true;
-        }
-
-        ~DbRepository()
-        {
-            Dispose(false);
-        }
-
-        /// <summary>
-        /// 执行与释放或重置非托管资源关联的应用程序定义的任务。
-        /// </summary>
-        public void Dispose()
-        {
-            Dispose(true);
+            DisposeTransaction();
+            _db.Dispose();
         }
 
         #endregion

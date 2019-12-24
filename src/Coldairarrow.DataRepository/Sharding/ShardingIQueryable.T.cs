@@ -1,4 +1,5 @@
 ﻿using Coldairarrow.Util;
+using Microsoft.EntityFrameworkCore;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -10,93 +11,86 @@ namespace Coldairarrow.DataRepository
 {
     internal class ShardingQueryable<T> : IShardingQueryable<T> where T : class, new()
     {
+        #region 构造函数
+
         public ShardingQueryable(IQueryable<T> source, DistributedTransaction transaction = null)
         {
             _source = source;
-            _absTableType = (_source.GetObjQuery() as IQueryable).ElementType;
+            _absTableType = source.ElementType;
             _absTableName = _absTableType.Name;
             _transaction = transaction;
         }
+
+        #endregion
+
+        #region 私有成员
+
         private DistributedTransaction _transaction { get; }
-        private bool _openTransaction { get => _transaction?.Disposed == false; }
+        private bool _openTransaction { get => _transaction?.OpenTransaction == true; }
         private Type _absTableType { get; }
         private string _absTableName { get; }
         private IQueryable<T> _source { get; set; }
-        private Type MapTable(Type absTable, string targetTableName)
+        private Type MapTable(string targetTableName)
         {
-            return ShardingHelper.MapTable(absTable, targetTableName);
+            return DbModelFactory.GetEntityType(targetTableName);
         }
-        public List<T> ToList()
+        private async Task<List<TResult>> GetStatisDataAsync<TResult>(Func<IQueryable, Task<TResult>> access, IQueryable newSource = null)
         {
-            //去除分页,获取前Take+Skip数量
-            int? take = _source.GetTakeCount();
-            int? skip = _source.GetSkipCount();
-            skip = skip == null ? 0 : skip;
-            var (sortColumn, sortType) = _source.GetOrderBy();
-            var noPaginSource = _source.RemoveTake().RemoveSkip();
-            if (!take.IsNullOrEmpty())
-                noPaginSource = noPaginSource.Take(take.Value + skip.Value);
-
-            //从各个分表获取数据
+            newSource = newSource ?? _source;
             var tables = ShardingConfig.Instance.GetReadTables(_absTableName);
-            List<Task<List<T>>> tasks = new List<Task<List<T>>>();
-            Dictionary<string, object> lockMap = new Dictionary<string, object>();
-            tables.GroupBy(x => x.conString)
-                .Select(x => x.Key)
-                .ForEach(x => lockMap.Add(x, new object()));
-            tables.ForEach(aTable =>
+            List<Task<TResult>> tasks = new List<Task<TResult>>();
+            SynchronizedCollection<IRepository> dbs = new SynchronizedCollection<IRepository>();
+            tasks = tables.Select(aTable =>
             {
-                tasks.Add(Task.Run(() =>
-                {
-                    var targetTable = MapTable(_absTableType, aTable.tableName);
-                    var targetDb = DbFactory.GetRepository(aTable.conString, aTable.dbType);
-                    if (_openTransaction)
-                        _transaction.AddRepository(targetDb);
-                    var targetIQ = targetDb.GetIQueryable(targetTable);
-                    var newQ = noPaginSource.ChangeSource(targetIQ);
-                    List<T> list = new List<T>();
-                    var theLock = lockMap[aTable.conString];
-                    if (_openTransaction)
-                        lock (theLock)
-                        {
-                            Run();
-                        }
-                    else
-                        Run();
+                var targetTable = MapTable(aTable.tableName);
+                var db = DbFactory.GetRepository(aTable.conString, aTable.dbType);
+                var targetIQ = db.GetIQueryable(targetTable);
+                var newQ = newSource.ChangeSource(targetIQ);
+                if (_openTransaction)
+                    _transaction.AddRepository(db);
+                else
+                    dbs.Add(db);
 
-                    return list;
+                return access(newQ);
+            }).ToList();
+            var res = (await Task.WhenAll(tasks)).ToList();
+            dbs.ForEach(x => x.Dispose());
 
-                    void Run()
-                    {
-                        list = newQ
-                            .CastToList<object>()
-                            .Select(x => x.ChangeType<T>())
-                            .ToList();
-                    }
-                }));
-            });
-            Task.WaitAll(tasks.ToArray());
-            List<T> all = new List<T>();
-            tasks.ForEach(aTask =>
-            {
-                all.AddRange(aTask.Result);
-            });
-
-            //合并数据
-            var resList = all;
-            if (!sortColumn.IsNullOrEmpty() && !sortType.IsNullOrEmpty())
-                resList = resList.AsQueryable().OrderBy($"{sortColumn} {sortType}").ToList();
-            if (!skip.IsNullOrEmpty())
-                resList = resList.Skip(skip.Value).ToList();
-            if (!take.IsNullOrEmpty())
-                resList = resList.Take(take.Value).ToList();
-
-            return resList;
+            return res;
         }
-        public T FirstOrDefault()
+        private async Task<int> GetCountAsync(IQueryable newSource)
         {
-            return ToList().FirstOrDefault();
+            var results = await GetStatisDataAsync<int>(x => EntityFrameworkQueryableExtensions.CountAsync((dynamic)x), newSource);
+            return results.Sum();
         }
+        private async Task<TResult> GetSumAsync<TResult>(IQueryable<TResult> newSource)
+        {
+            var results = await GetStatisDataAsync<TResult>(x => EntityFrameworkQueryableExtensions.SumAsync((dynamic)x), newSource);
+            return Enumerable.Sum((dynamic)results);
+        }
+        private async Task<TResult> GetSumAsync<TResult>(Expression<Func<T, TResult>> selector)
+        {
+            var newSource = _source.Select(selector);
+            return await GetSumAsync(newSource);
+        }
+        private async Task<dynamic> GetDynamicAverageAsync<TResult>(Expression<Func<T, TResult>> selector)
+        {
+            var newSource = _source.Select(selector);
+            //总数量
+            var allCount = await GetCountAsync(newSource);
+
+            //总合
+            var sum = await GetSumAsync(newSource);
+            if (sum is int || sum is int? || sum is long || sum is long?)
+                return ((double?)(dynamic)sum) / allCount;
+            else
+                return (dynamic)sum / allCount;
+        }
+
+        #endregion
+
+        #region 外部接口
+
         public IShardingQueryable<T> Where(Expression<Func<T, bool>> predicate)
         {
             _source = _source.Where(predicate);
@@ -139,142 +133,279 @@ namespace Coldairarrow.DataRepository
 
             return this;
         }
+        public int Count()
+        {
+            return AsyncHelper.RunSync(() => CountAsync());
+        }
+        public async Task<int> CountAsync()
+        {
+            return await GetCountAsync(_source);
+        }
+        public List<T> ToList()
+        {
+            return AsyncHelper.RunSync(() => ToListAsync());
+        }
+        public async Task<List<T>> ToListAsync()
+        {
+            //去除分页,获取前Take+Skip数量
+            int? take = _source.GetTakeCount();
+            int? skip = _source.GetSkipCount();
+            skip = skip == null ? 0 : skip;
+            var (sortColumn, sortType) = _source.GetOrderBy();
+            var noPaginSource = _source.RemoveTake().RemoveSkip();
+            if (!take.IsNullOrEmpty())
+                noPaginSource = noPaginSource.Take(take.Value + skip.Value);
+
+            //从各个分表获取数据
+            var tables = ShardingConfig.Instance.GetReadTables(_absTableName);
+            SynchronizedCollection<IRepository> dbs = new SynchronizedCollection<IRepository>();
+            List<Task<List<T>>> tasks = tables.Select(aTable =>
+            {
+                var targetTable = MapTable(aTable.tableName);
+                var targetDb = DbFactory.GetRepository(aTable.conString, aTable.dbType);
+                if (_openTransaction)
+                    _transaction.AddRepository(targetDb);
+                else
+                    dbs.Add(targetDb);
+                var targetIQ = targetDb.GetIQueryable(targetTable);
+                var newQ = noPaginSource.ChangeSource(targetIQ);
+                return newQ
+                    .Cast<object>()
+                    .Select(x => x.ChangeType<T>())
+                    .ToListAsync();
+            }).ToList();
+            List<T> all = new List<T>();
+            (await Task.WhenAll(tasks.ToArray())).ToList().ForEach(x => all.AddRange(x));
+            dbs.ForEach(x => x.Dispose());
+            //合并数据
+            var resList = all;
+            if (!sortColumn.IsNullOrEmpty() && !sortType.IsNullOrEmpty())
+                resList = resList.AsQueryable().OrderBy($"{sortColumn} {sortType}").ToList();
+            if (!skip.IsNullOrEmpty())
+                resList = resList.Skip(skip.Value).ToList();
+            if (!take.IsNullOrEmpty())
+                resList = resList.Take(take.Value).ToList();
+
+            return resList;
+        }
+        public T FirstOrDefault()
+        {
+            return AsyncHelper.RunSync(() => FirstOrDefaultAsync());
+        }
+        public async Task<T> FirstOrDefaultAsync()
+        {
+            var list = await GetStatisDataAsync(async x =>
+            {
+                var data = await EntityFrameworkQueryableExtensions.FirstOrDefaultAsync((dynamic)x);
+                return (data as object)?.ChangeType<T>();
+            });
+            list.RemoveAll(x => x == null);
+            return list.FirstOrDefault();
+        }
         public List<T> GetPagination(Pagination pagination)
+        {
+            return AsyncHelper.RunSync(() => GetPaginationAsync(pagination));
+        }
+        public async Task<List<T>> GetPaginationAsync(Pagination pagination)
         {
             pagination.Total = Count();
             _source = _source.OrderBy($"{pagination.SortField} {pagination.SortType}");
 
-            return Skip((pagination.PageIndex - 1) * pagination.PageRows).Take(pagination.PageRows).ToList();
-        }
-        private List<dynamic> GetStatisData(Func<IQueryable, dynamic> access, IQueryable<T> newSource = null)
-        {
-            newSource = newSource ?? _source;
-            var tables = ShardingConfig.Instance.GetReadTables(_absTableName);
-            List<Task<dynamic>> tasks = new List<Task<dynamic>>();
-            tables.ForEach(aTable =>
-            {
-                tasks.Add(Task.Run(() =>
-                {
-                    var targetTable = MapTable(_absTableType, aTable.tableName);
-                    var targetIQ = DbFactory.GetRepository(aTable.conString, aTable.dbType).GetIQueryable(targetTable);
-                    var newQ = newSource.ChangeSource(targetIQ);
-
-                    return access(newQ);
-                }));
-            });
-            Task.WaitAll(tasks.ToArray());
-
-            return tasks.Select(x => x.Result).ToList();
-        }
-        public int Count()
-        {
-            return GetStatisData(x => x.Count()).Sum(x => (int)x);
+            return await Skip((pagination.PageIndex - 1) * pagination.PageRows).Take(pagination.PageRows).ToListAsync();
         }
         public TResult Max<TResult>(Expression<Func<T, TResult>> selector)
         {
-            return GetStatisData(x => x.Max(selector)).Max(x => (TResult)x);
+            return AsyncHelper.RunSync(() => MaxAsync(selector));
+        }
+        public async Task<TResult> MaxAsync<TResult>(Expression<Func<T, TResult>> selector)
+        {
+            var newSource = _source.Select(selector);
+            var results = await GetStatisDataAsync<TResult>(x => EntityFrameworkQueryableExtensions.MaxAsync((dynamic)x), newSource);
+
+            return results.Max();
         }
         public TResult Min<TResult>(Expression<Func<T, TResult>> selector)
         {
-            return GetStatisData(x => x.Min(selector)).Min(x => (TResult)x);
+            return AsyncHelper.RunSync(() => MinAsync(selector));
         }
-        private dynamic DynamicAverage(dynamic selector)
+        public async Task<TResult> MinAsync<TResult>(Expression<Func<T, TResult>> selector)
         {
-            var list = GetStatisData(x => new KeyValuePair<int, dynamic>(x.Count(), Coldairarrow.Util.Extention.DynamicSum(x, selector))).Select(x => (KeyValuePair<int, dynamic>)x).ToList();
-            var count = list.Sum(x => x.Key);
-            dynamic sumList = list.Select(x => (decimal?)x.Value).ToList();
-            dynamic sum = Enumerable.Sum(sumList);
+            var newSource = _source.Select(selector);
+            var results = await GetStatisDataAsync<TResult>(x => EntityFrameworkQueryableExtensions.MinAsync((dynamic)x), newSource);
 
-            return (decimal?)sum / count;
-        }
-        private dynamic DynamicSum(dynamic selector)
-        {
-            return GetStatisData(x => Coldairarrow.Util.Extention.DynamicSum(x, selector)).Sum(x => (decimal?)x);
+            return results.Min();
         }
         public double Average(Expression<Func<T, int>> selector)
         {
-            return (double)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<double> AverageAsync(Expression<Func<T, int>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public double? Average(Expression<Func<T, int?>> selector)
         {
-            return (double?)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<double?> AverageAsync(Expression<Func<T, int?>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public float Average(Expression<Func<T, float>> selector)
         {
-            return (float)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<float> AverageAsync(Expression<Func<T, float>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public float? Average(Expression<Func<T, float?>> selector)
         {
-            return (float?)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<float?> AverageAsync(Expression<Func<T, float?>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public double Average(Expression<Func<T, long>> selector)
         {
-            return (double)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<double> AverageAsync(Expression<Func<T, long>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public double? Average(Expression<Func<T, long?>> selector)
         {
-            return (double?)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<double?> AverageAsync(Expression<Func<T, long?>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public double Average(Expression<Func<T, double>> selector)
         {
-            return (double)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<double> AverageAsync(Expression<Func<T, double>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public double? Average(Expression<Func<T, double?>> selector)
         {
-            return (double?)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<double?> AverageAsync(Expression<Func<T, double?>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public decimal Average(Expression<Func<T, decimal>> selector)
         {
-            return (decimal)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<decimal> AverageAsync(Expression<Func<T, decimal>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public decimal? Average(Expression<Func<T, decimal?>> selector)
         {
-            return (decimal?)DynamicAverage(selector);
+            return AsyncHelper.RunSync(() => AverageAsync(selector));
+        }
+        public async Task<decimal?> AverageAsync(Expression<Func<T, decimal?>> selector)
+        {
+            return await GetDynamicAverageAsync(selector);
         }
         public decimal Sum(Expression<Func<T, decimal>> selector)
         {
-            return (decimal)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<decimal> SumAsync(Expression<Func<T, decimal>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public decimal? Sum(Expression<Func<T, decimal?>> selector)
         {
-            return (decimal?)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<decimal?> SumAsync(Expression<Func<T, decimal?>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public double Sum(Expression<Func<T, double>> selector)
         {
-            return (double)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<double> SumAsync(Expression<Func<T, double>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public double? Sum(Expression<Func<T, double?>> selector)
         {
-            return (double?)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<double?> SumAsync(Expression<Func<T, double?>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public float Sum(Expression<Func<T, float>> selector)
         {
-            return (float)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<float> SumAsync(Expression<Func<T, float>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public float? Sum(Expression<Func<T, float?>> selector)
         {
-            return (float?)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<float?> SumAsync(Expression<Func<T, float?>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public int Sum(Expression<Func<T, int>> selector)
         {
-            return (int)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<int> SumAsync(Expression<Func<T, int>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public int? Sum(Expression<Func<T, int?>> selector)
         {
-            return (int?)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<int?> SumAsync(Expression<Func<T, int?>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public long Sum(Expression<Func<T, long>> selector)
         {
-            return (long)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<long> SumAsync(Expression<Func<T, long>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public long? Sum(Expression<Func<T, long?>> selector)
         {
-            return (long?)DynamicSum(selector);
+            return AsyncHelper.RunSync(() => SumAsync(selector));
+        }
+        public async Task<long?> SumAsync(Expression<Func<T, long?>> selector)
+        {
+            return await GetSumAsync(selector);
         }
         public bool Any(Expression<Func<T, bool>> predicate)
         {
-            var newSource = _source.Where(predicate);
-            return GetStatisData(x => x.Any(), newSource).Any(x => x == true);
+            return AsyncHelper.RunSync(() => AnyAsync(predicate));
         }
+        public async Task<bool> AnyAsync(Expression<Func<T, bool>> predicate)
+        {
+            var newSource = _source.Where(predicate);
+            return (await GetStatisDataAsync<bool>(x => EntityFrameworkQueryableExtensions.AnyAsync((dynamic)x), newSource))
+                .Any(x => x == true);
+        }
+
+        #endregion
     }
 }
